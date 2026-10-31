@@ -34,6 +34,28 @@ const ALLOWED_COVER_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp'])
 const MULTIPART_MIN_PART = 8 * 1024 * 1024
 const MULTIPART_MAX_PARTS = 9000
 
+/**
+ * 把 COS 的英文报错翻译成「下一步该干什么」。
+ * 最常见的是密钥被轮换/禁用后忘了更新 Vercel 变量，原始信息只有一句
+ * "The Access Key Id you provided does not exist in our records"，对使用者毫无指导意义。
+ */
+function cosFriendlyError(err) {
+  const msg = String(err?.message || err || '')
+  if (/Access Key Id/i.test(msg)) {
+    return 'COS 密钥无效或已被禁用。请到腾讯云访问管理确认密钥状态，并把新的 COS_SECRET_ID / COS_SECRET_KEY 更新到 Vercel 环境变量后重新部署。'
+  }
+  if (/SignatureDoesNotMatch/i.test(msg)) {
+    return 'COS 签名不匹配：COS_SECRET_KEY 与 COS_SECRET_ID 不配套（或复制时漏了字符），请重新核对这对密钥。'
+  }
+  if (/AccessDenied|Forbidden/i.test(msg)) {
+    return 'COS 权限不足：该密钥没有当前桶的 PutObject / GetObject 权限。'
+  }
+  if (/NoSuchBucket/i.test(msg)) {
+    return 'COS 桶不存在：请检查 COS_BUCKET 是否带了 APPID（如 dfg-1318639785）。'
+  }
+  return `对象存储错误：${msg || '未知错误'}`
+}
+
 // 读取文件头部若干字节（避免把 2GB 视频整个读进内存）
 function readHead(filePath, len = 65536) {
   const fd = fs.openSync(filePath, 'r')
@@ -331,7 +353,13 @@ router.post(
       Math.ceil(size / MULTIPART_MAX_PARTS / 1024 / 1024) * 1024 * 1024,
     )
     const key = buildKey('video', newUploadName(ext))
-    const uploadId = await multipartInit(key, String(body.content_type || 'video/mp4'))
+    let uploadId
+    try {
+      uploadId = await multipartInit(key, String(body.content_type || 'video/mp4'))
+    } catch (e) {
+      console.error('[upload] multipartInit 失败:', e)
+      return res.status(502).json({ message: cosFriendlyError(e) })
+    }
     res.json({ key, uploadId, partSize, partCount: size ? Math.ceil(size / partSize) : 0 })
   }),
 )
@@ -374,9 +402,16 @@ router.post(
     if (!uploadId) return res.status(400).json({ message: '缺少 uploadId' })
 
     // ETag 由服务端 listParts 取，不依赖浏览器读响应头（桶没配 ExposeHeaders 也能用）
-    const parts = await listMultipartParts(key, uploadId)
-    if (!parts.length) return res.status(400).json({ message: '没有已上传的分片，无法合并' })
-    const url = await completeMultipart(key, uploadId, parts)
+    let parts
+    let url
+    try {
+      parts = await listMultipartParts(key, uploadId)
+      if (!parts.length) return res.status(400).json({ message: '没有已上传的分片，无法合并' })
+      url = await completeMultipart(key, uploadId, parts)
+    } catch (e) {
+      console.error('[upload] multipartComplete 失败:', e)
+      return res.status(502).json({ message: cosFriendlyError(e) })
+    }
     res.json({ key, publicUrl: url, parts: parts.length })
   }),
 )
