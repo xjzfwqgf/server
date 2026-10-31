@@ -1,0 +1,29 @@
+{
+  "name": "video-site-server",
+  "version": "1.0.0",
+  "description": "夜场视频站后端 API（Vercel Node Function + Turso + 腾讯云 COS）",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "seed": "node seed.js",
+    "reset": "node reset.js",
+    "reset-admin-pw": "node reset-admin-password.js",
+    "migrate:db": "node scripts/migrate-db-to-turso.mjs",
+    "migrate:music": "node scripts/migrate-music-to-cos.mjs",
+    "migrate:videos": "node scripts/migrate-videos-to-cos.mjs"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.15.9",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "cos-nodejs-sdk-v5": "^2.14.6",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.0.1"
+  }
+}

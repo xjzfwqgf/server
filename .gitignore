@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.local
+.jwt-secret
+data.db
+data.db-wal
+data.db-shm
+uploads/
+data/
+*.log
+.tmp-*
