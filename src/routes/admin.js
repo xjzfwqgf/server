@@ -3,9 +3,43 @@ import { db } from '../db.js'
 import { ah } from '../middleware/async.js'
 import { requireAdmin } from '../middleware/auth.js'
 import { categories } from '../config.js'
+import { isCos, deleteObject, buildKey, resolveStoredKey } from '../storage.js'
 
 const router = Router()
 router.use(requireAdmin)
+
+/**
+ * 删除视频时顺带清理对象存储（视频本体 + 首帧封面）。
+ * 故意做成 best-effort：对象删不掉只记日志，不能因为存储侧抖动就让数据库删除失败——
+ * 留下孤儿对象只是浪费空间，留下删不掉的记录才是真的麻烦。
+ */
+async function purgeVideoObjects(rows) {
+  if (!isCos()) return 0
+  let n = 0
+  for (const v of rows) {
+    if (v.filename && !/^https?:\/\//i.test(v.filename)) {
+      const key = v.filename.includes('/') ? v.filename : buildKey('video', v.filename)
+      try {
+        await deleteObject(key)
+        n++
+      } catch (e) {
+        console.warn('[admin] 删除 COS 视频对象失败:', key, e.message)
+      }
+    }
+    if (v.cover_url && /^https?:\/\//i.test(v.cover_url)) {
+      const key = resolveStoredKey(v.cover_url, 'cover')
+      if (key) {
+        try {
+          await deleteObject(key)
+          n++
+        } catch (e) {
+          console.warn('[admin] 删除 COS 封面失败:', key, e.message)
+        }
+      }
+    }
+  }
+  return n
+}
 
 // ---------- 数据统计 ----------
 router.get('/stats', ah(async (req, res) => {
@@ -200,7 +234,46 @@ router.delete('/videos/:id', ah(async (req, res) => {
   await db.run('DELETE FROM comments WHERE video_id = ?', [v.id])
   await db.run('DELETE FROM danmaku WHERE video_id = ?', [v.id])
   await db.run('DELETE FROM videos WHERE id = ?', [v.id])
+  await purgeVideoObjects([v])
   res.json({ message: '已删除' })
+}))
+
+// ---------- 批量删除视频 ----------
+// 前端勾选多行后一次提交；子表 + 主表放在同一个事务里，避免删到一半失败留下半截数据。
+router.post('/videos/batch-delete', ah(async (req, res) => {
+  const raw = Array.isArray(req.body?.ids) ? req.body.ids : []
+  const ids = [
+    ...new Set(raw.map((x) => parseInt(x, 10)).filter((n) => Number.isInteger(n) && n > 0)),
+  ]
+  if (!ids.length) return res.status(400).json({ message: '请先勾选要删除的视频' })
+  if (ids.length > 200) {
+    return res.status(400).json({ message: '单次最多删除 200 个视频，请分批操作' })
+  }
+
+  const ph = ids.map(() => '?').join(',')
+  const rows = await db.all(`SELECT id, filename, cover_url FROM videos WHERE id IN (${ph})`, ids)
+  if (!rows.length) return res.status(404).json({ message: '选中的视频都不存在' })
+
+  const found = rows.map((r) => r.id)
+  const ph2 = found.map(() => '?').join(',')
+  await db.tx(async (t) => {
+    await t.run(`DELETE FROM video_likes WHERE video_id IN (${ph2})`, found)
+    await t.run(`DELETE FROM favorites WHERE video_id IN (${ph2})`, found)
+    await t.run(`DELETE FROM history WHERE video_id IN (${ph2})`, found)
+    await t.run(`DELETE FROM comments WHERE video_id IN (${ph2})`, found)
+    await t.run(`DELETE FROM danmaku WHERE video_id IN (${ph2})`, found)
+    await t.run(`DELETE FROM videos WHERE id IN (${ph2})`, found)
+  })
+
+  const objectsDeleted = await purgeVideoObjects(rows)
+  const missing = ids.length - found.length
+
+  res.json({
+    message: `已删除 ${found.length} 个视频${missing ? `（${missing} 个不存在已跳过）` : ''}`,
+    deleted: found.length,
+    missing,
+    objectsDeleted,
+  })
 }))
 
 // ---------- 合集管理 ----------
