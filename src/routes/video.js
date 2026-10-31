@@ -232,9 +232,13 @@ router.post(
         message: kind === 'cover' ? '仅支持 jpg/png/webp 封面' : '仅支持视频文件扩展名',
       })
     }
+    // 签名有效期按用途区分：封面很小，15 分钟够用；
+    // 视频可能到 4GB，慢速网络要传十几到几十分钟，15 分钟会在传一半时过期。
+    // 注意：签名 URL 只在上传开始时校验一次，过期时间是 COS 侧的策略，不是请求时限。
+    const expires = kind === 'cover' ? 900 : 3600
     const key = buildKey(kind, newUploadName(ext))
-    const url = await presignPut(key, { expires: 900 })
-    res.json({ key, url, publicUrl: publicUrl(key), expiresIn: 900 })
+    const url = await presignPut(key, { expires })
+    res.json({ key, url, publicUrl: publicUrl(key), expiresIn: expires })
   }),
 )
 

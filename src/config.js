@@ -102,10 +102,12 @@ export const config = {
     },
   },
   // 上传限制
-  // 单文件上限，可用 MAX_VIDEO_SIZE_MB 覆盖（默认 2048，即 2GB）。
-  // 注意这只是「允不允许收」，不是「有没有地方放」——磁盘空间不够时，
+  // 单文件上限，可用 MAX_VIDEO_SIZE_MB 覆盖（默认 4096，即 4GB）。
+  // ⚠️ COS 单次 PUT 的硬上限是 5GB：4GB 属于「直传可用」的安全区；
+  //    再往上必须改成 COS 分片上传，当前代码不支持。
+  // 注意这只是「允不允许收」，不是「有没有地方放」——本地磁盘空间不够时，
   // 会在拷贝/写入阶段直接报 ENOSPC，跟这个上限无关。
-  maxVideoSize: (Number(process.env.MAX_VIDEO_SIZE_MB) || 2048) * 1024 * 1024,
+  maxVideoSize: (Number(process.env.MAX_VIDEO_SIZE_MB) || 4096) * 1024 * 1024,
   maxCoverSize: 10 * 1024 * 1024, // 10MB
   // 本机路径导入（仅管理员的 /api/video/import-local）：允许读取的根目录白名单。
   // 分隔符用系统路径分隔符（Windows 为 ;）——不能用 :，因为盘符里就带冒号。例如：
