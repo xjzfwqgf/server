@@ -83,8 +83,102 @@ export async function presignPut(key, { expires = 900 } = {}) {
   })
 }
 
-/** 服务端写入对象（迁移脚本、种子数据用；不经过浏览器） */
-export async function putObject(key, body, contentType = 'application/octet-stream') {
+// ---------- 分片上传（Multipart Upload） ----------
+// COS 单次 PUT 上限 5GB，超过就必须走分片：init 拿 uploadId → 浏览器并发 PUT 每个分片
+// （每个分片一个预签名 URL）→ 后端 listParts 汇总 ETag 后 complete。
+// ETag 由后端 listParts 拿，而不是让浏览器从响应头读：这样不依赖桶的 ExposeHeaders 配置，
+// 少一个「明明上传成功却 complete 失败」的坑。
+
+/** 初始化分片上传，返回 UploadId */
+export async function multipartInit(key, contentType = 'application/octet-stream') {
+  assertCosConfigured()
+  const cos = await getCos()
+  return new Promise((resolve, reject) => {
+    cos.multipartInit(
+      { Bucket: s.bucket, Region: s.region, Key: key, ContentType: contentType },
+      (err, data) => (err ? reject(err) : resolve(data.UploadId)),
+    )
+  })
+}
+
+/** 给第 N 个分片签一个预签名 PUT 地址（uploadId/partNumber 参与签名） */
+export async function presignUploadPart(key, uploadId, partNumber, { expires = 3600 } = {}) {
+  assertCosConfigured()
+  const cos = await getCos()
+  return new Promise((resolve, reject) => {
+    cos.getObjectUrl(
+      {
+        Bucket: s.bucket,
+        Region: s.region,
+        Key: key,
+        Method: 'PUT',
+        Sign: true,
+        Expires: Math.max(1, Math.floor(expires)),
+        Query: { uploadId, partNumber: String(partNumber) },
+      },
+      (err, data) => (err ? reject(err) : resolve(data.Url)),
+    )
+  })
+}
+
+/** 列出某个 uploadId 已上传的分片（自动翻页），返回 [{PartNumber, ETag}] */
+export async function listMultipartParts(key, uploadId) {
+  assertCosConfigured()
+  const cos = await getCos()
+  const parts = []
+  let marker = undefined
+  for (let page = 0; page < 20; page++) {
+    const data = await new Promise((resolve, reject) => {
+      cos.multipartListPart(
+        {
+          Bucket: s.bucket,
+          Region: s.region,
+          Key: key,
+          UploadId: uploadId,
+          MaxParts: 1000,
+          ...(marker ? { PartNumberMarker: marker } : {}),
+        },
+        (err, d) => (err ? reject(err) : resolve(d)),
+      )
+    })
+    const list = data.Part || []
+    for (const p of list) {
+      parts.push({ PartNumber: Number(p.PartNumber), ETag: p.ETag })
+    }
+    const truncated = data.IsTruncated === true || data.IsTruncated === 'true'
+    if (!truncated || !data.NextPartNumberMarker) break
+    marker = data.NextPartNumberMarker
+  }
+  parts.sort((a, b) => a.PartNumber - b.PartNumber)
+  return parts
+}
+
+/** 合并分片，返回最终对象的公开地址 */
+export async function completeMultipart(key, uploadId, parts) {
+  assertCosConfigured()
+  const cos = await getCos()
+  await new Promise((resolve, reject) => {
+    cos.multipartComplete(
+      { Bucket: s.bucket, Region: s.region, Key: key, UploadId: uploadId, Parts: parts },
+      (err) => (err ? reject(err) : resolve()),
+    )
+  })
+  return publicUrl(key)
+}
+
+/** 放弃分片上传（清理已上传的分片，释放空间） */
+export async function abortMultipart(key, uploadId) {
+  assertCosConfigured()
+  const cos = await getCos()
+  await new Promise((resolve, reject) => {
+    cos.multipartAbort(
+      { Bucket: s.bucket, Region: s.region, Key: key, UploadId: uploadId },
+      (err) => (err ? reject(err) : resolve()),
+    )
+  })
+}
+
+/** 服务端写入对象（迁移脚本、种子数据用；不经过浏览器） */export async function putObject(key, body, contentType = 'application/octet-stream') {
   if (!isCos()) {
     const abs = path.join(config.uploadDir, key)
     fs.mkdirSync(path.dirname(abs), { recursive: true })

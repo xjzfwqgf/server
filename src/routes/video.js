@@ -15,6 +15,11 @@ import {
   isAllowedKey,
   deleteObject,
   resolveStoredKey,
+  multipartInit,
+  presignUploadPart,
+  listMultipartParts,
+  completeMultipart,
+  abortMultipart,
 } from '../storage.js'
 import { VIDEO_COLUMNS, BASE_JOIN, publicVideo } from '../video-util.js'
 
@@ -23,6 +28,11 @@ const router = Router()
 // 允许上传的视频扩展名（白名单）
 const ALLOWED_VIDEO_EXTS = new Set(['.mp4', '.webm', '.mkv', '.mov', '.ogg', '.avi', '.ts', '.flv'])
 const ALLOWED_COVER_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp'])
+
+// COS 单次 PUT 上限 5GB：更大的文件走分片上传。
+// 分片太小会让请求数爆炸，所以从 8MB 起步；同时保证总片数 ≤ 9000（COS 上限 10000）。
+const MULTIPART_MIN_PART = 8 * 1024 * 1024
+const MULTIPART_MAX_PARTS = 9000
 
 // 读取文件头部若干字节（避免把 2GB 视频整个读进内存）
 function readHead(filePath, len = 65536) {
@@ -294,6 +304,97 @@ router.post(
     )
     const video = await getVideo(info.lastInsertRowid)
     res.json({ video: publicVideo(video) })
+  }),
+)
+
+// ---------- 分片上传（>5GB 的大文件；COS 单次 PUT 上限 5GB） ----------
+router.post(
+  '/multipart/init',
+  requireAdmin,
+  ah(async (req, res) => {
+    if (!isCos()) {
+      return res.status(409).json({ message: '本地存储模式不支持分片上传，请使用表单上传' })
+    }
+    const body = req.body || {}
+    const ext = path.extname(String(body.filename || '')).toLowerCase()
+    if (!ALLOWED_VIDEO_EXTS.has(ext)) {
+      return res.status(400).json({ message: '仅支持视频文件扩展名' })
+    }
+    const size = Math.max(0, parseInt(body.size, 10) || 0)
+    if (size > config.maxVideoSize) {
+      const gb = Math.round((config.maxVideoSize / 1024 / 1024 / 1024) * 10) / 10
+      return res.status(413).json({ message: `文件超过 ${gb}GB 上限` })
+    }
+    // 分片大小：至少 8MB，同时保证总片数不超过 9000
+    const partSize = Math.max(
+      MULTIPART_MIN_PART,
+      Math.ceil(size / MULTIPART_MAX_PARTS / 1024 / 1024) * 1024 * 1024,
+    )
+    const key = buildKey('video', newUploadName(ext))
+    const uploadId = await multipartInit(key, String(body.content_type || 'video/mp4'))
+    res.json({ key, uploadId, partSize, partCount: size ? Math.ceil(size / partSize) : 0 })
+  }),
+)
+
+router.post(
+  '/multipart/sign',
+  requireAdmin,
+  ah(async (req, res) => {
+    if (!isCos()) return res.status(409).json({ message: '本地存储模式不支持分片上传' })
+    const body = req.body || {}
+    const key = String(body.key || '')
+    const uploadId = String(body.uploadId || '')
+    if (!isAllowedKey(key, ['video'])) return res.status(400).json({ message: '非法的对象 key' })
+    if (!uploadId || uploadId.length > 256) return res.status(400).json({ message: '缺少 uploadId' })
+    const nums = Array.isArray(body.partNumbers)
+      ? body.partNumbers
+          .map((n) => parseInt(n, 10))
+          .filter((n) => Number.isInteger(n) && n >= 1 && n <= 10000)
+      : []
+    if (!nums.length) return res.status(400).json({ message: '缺少分片序号' })
+    if (nums.length > 100) return res.status(400).json({ message: '单次最多签 100 个分片' })
+
+    const parts = []
+    for (const partNumber of nums) {
+      parts.push({ partNumber, url: await presignUploadPart(key, uploadId, partNumber) })
+    }
+    res.json({ parts })
+  }),
+)
+
+router.post(
+  '/multipart/complete',
+  requireAdmin,
+  ah(async (req, res) => {
+    if (!isCos()) return res.status(409).json({ message: '本地存储模式不支持分片上传' })
+    const body = req.body || {}
+    const key = String(body.key || '')
+    const uploadId = String(body.uploadId || '')
+    if (!isAllowedKey(key, ['video'])) return res.status(400).json({ message: '非法的对象 key' })
+    if (!uploadId) return res.status(400).json({ message: '缺少 uploadId' })
+
+    // ETag 由服务端 listParts 取，不依赖浏览器读响应头（桶没配 ExposeHeaders 也能用）
+    const parts = await listMultipartParts(key, uploadId)
+    if (!parts.length) return res.status(400).json({ message: '没有已上传的分片，无法合并' })
+    const url = await completeMultipart(key, uploadId, parts)
+    res.json({ key, publicUrl: url, parts: parts.length })
+  }),
+)
+
+router.post(
+  '/multipart/abort',
+  requireAdmin,
+  ah(async (req, res) => {
+    if (!isCos()) return res.status(409).json({ message: '本地存储模式不支持分片上传' })
+    const body = req.body || {}
+    const key = String(body.key || '')
+    const uploadId = String(body.uploadId || '')
+    if (!isAllowedKey(key, ['video']) || !uploadId) {
+      return res.status(400).json({ message: '参数不合法' })
+    }
+    // 清理失败也不影响前端：未完成的分片会由桶的生命周期规则回收
+    await abortMultipart(key, uploadId).catch(() => {})
+    res.json({ ok: true })
   }),
 )
 
