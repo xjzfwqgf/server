@@ -11,7 +11,12 @@ import { config } from '../config.js'
 import { normalizeSongs, normalizePlaylists, parseLrc, extractLyricText, pick } from './normalize.js'
 
 /** KuGouMusicApi 基址。刻意用函数读，方便测试时改 config。 */
-const base = () => String(config.music.kugouApiBase || '').replace(/\/$/, '')
+const base = () => {
+  const raw = String(config.music.kugouApiBase || '').trim().replace(/\/+$/, '')
+  if (!raw) return ''
+  // 允许只填主机名（kgapi.example.com）：缺协议时 new URL() 会直接抛 Invalid URL。
+  return /^https?:\/\//i.test(raw) ? raw : `https://${raw}`
+}
 
 export class KugouError extends Error {
   constructor(message, { code, httpStatus, body } = {}) {
@@ -90,7 +95,12 @@ export async function request(path, { params = {}, fresh = false, session = null
   const cookie = buildCookie(session)
   if (cookie) finalParams.cookie = cookie
 
-  const url = new URL(base() + path)
+  const root = base()
+  if (!root) {
+    throw new KugouError('KUGOU_API_BASE 未配置（形如 https://kgapi.example.com）', { httpStatus: 0 })
+  }
+
+  const url = new URL(root + path)
   for (const [k, v] of Object.entries(finalParams)) {
     if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v))
   }
